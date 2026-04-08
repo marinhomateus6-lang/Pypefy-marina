@@ -5,9 +5,9 @@ import requests
 # ─────────────────────────────────────────
 # CONFIGURAÇÕES
 # ─────────────────────────────────────────
-PIPEFY_TOKEN  = os.environ.get("PIPEFY_TOKEN")   # secret do GitHub
-SLACK_WEBHOOK = os.environ.get("SLACK_WEBHOOK")  # secret do GitHub
-PHASE_ID      = "324693543"                       # fase Validação
+PIPEFY_TOKEN  = os.environ.get("PIPEFY_TOKEN")
+PHASE_ID      = os.environ.get("PHASE_ID", "324693543")   # fase Validação
+SLACK_WEBHOOK = os.environ.get("SLACK_WEBHOOK")
 NOTIFIED_FILE = "notified_cards.json"
 
 REQUIRED_FIELDS = [
@@ -17,26 +17,32 @@ REQUIRED_FIELDS = [
 ]
 
 # ─────────────────────────────────────────
-# FUNÇÕES
+# CONTROLE DE DUPLICATAS
 # ─────────────────────────────────────────
 
-def load_notified():
+def load_notified() -> set:
+    """Carrega os IDs já notificados como um conjunto (set) para busca O(1)."""
     if os.path.exists(NOTIFIED_FILE):
         with open(NOTIFIED_FILE, "r") as f:
-            return json.load(f)
-    return []
+            data = json.load(f)
+            return set(data) if isinstance(data, list) else set()
+    return set()
 
 
-def save_notified(ids):
+def save_notified(ids: set):
+    """Salva os IDs notificados em ordem para facilitar leitura."""
     with open(NOTIFIED_FILE, "w") as f:
-        json.dump(ids, f, indent=2)
+        json.dump(sorted(ids), f, indent=2)
 
 
-def fetch_cards():
+# ─────────────────────────────────────────
+# PIPEFY
+# ─────────────────────────────────────────
+
+def fetch_cards() -> list:
     query = """
     query($phaseId: ID!) {
       phase(id: $phaseId) {
-        name
         cards(first: 50) {
           edges {
             node {
@@ -59,6 +65,7 @@ def fetch_cards():
             "Content-Type": "application/json",
         },
         json={"query": query, "variables": {"phaseId": PHASE_ID}},
+        timeout=30,
     )
     response.raise_for_status()
     data = response.json()
@@ -66,25 +73,27 @@ def fetch_cards():
     if "errors" in data:
         raise Exception(f"Erro na API do Pipefy: {data['errors']}")
 
-    edges = data["data"]["phase"]["cards"]["edges"]
-    return [edge["node"] for edge in edges]
+    return [edge["node"] for edge in data["data"]["phase"]["cards"]["edges"]]
 
 
-def all_fields_filled(card):
-    field_map = {f["name"]: f["value"] for f in card["fields"]}
-    for field in REQUIRED_FIELDS:
-        value = field_map.get(field, "")
-        if not value or str(value).strip() == "":
-            return False
-    return True
+def all_fields_filled(card) -> bool:
+    field_map = {f["name"]: (f["value"] or "").strip() for f in card["fields"]}
+    missing = [f for f in REQUIRED_FIELDS if not field_map.get(f)]
+    if missing:
+        print(f"    Campos faltando: {missing}")
+    return len(missing) == 0
 
 
-def get_field(card, name):
+def get_field(card, name) -> str:
     for f in card["fields"]:
         if f["name"] == name:
-            return f["value"] or "—"
+            return (f["value"] or "").strip() or "—"
     return "—"
 
+
+# ─────────────────────────────────────────
+# SLACK
+# ─────────────────────────────────────────
 
 def send_slack(card):
     nome     = get_field(card, "Nome do titular da conta de internet")
@@ -98,13 +107,13 @@ def send_slack(card):
             f"*Nome do titular:* {nome}\n"
             f"*CPF/CNPJ:* {cpf}\n"
             f"*Telefone:* {telefone}\n"
-            f"*Link:* https://app.pipefy.com/open-cards/{card['id']}"
+            f"*Abrir no Pipefy:* https://app.pipefy.com/open-cards/{card['id']}"
         )
     }
 
-    response = requests.post(SLACK_WEBHOOK, json=message)
+    response = requests.post(SLACK_WEBHOOK, json=message, timeout=15)
     response.raise_for_status()
-    print(f"  Notificado: {card['title']} (ID {card['id']})")
+    print(f"  ✓ Slack notificado: {card['title']} (ID {card['id']})")
 
 
 # ─────────────────────────────────────────
@@ -112,27 +121,39 @@ def send_slack(card):
 # ─────────────────────────────────────────
 
 def main():
-    print("Buscando cards na fase Validacao (ID 324693543)...")
+    print(f"Buscando cards na fase Validação (ID {PHASE_ID})...")
     cards = fetch_cards()
     print(f"  {len(cards)} card(s) encontrado(s).")
 
+    # Carrega IDs já notificados (set garante que nunca há duplicata)
     notified = load_notified()
-    new_notified = list(notified)
+    print(f"  {len(notified)} card(s) já notificado(s) anteriormente.")
+
+    new_notified = set(notified)  # copia para não modificar o original durante o loop
 
     for card in cards:
-        if card["id"] in notified:
-            print(f"  Ja notificado: {card['title']}")
+        card_id = str(card["id"])  # garante que o ID é sempre string
+        print(f"\n  Card: {card['title']} (ID {card_id})")
+
+        if card_id in notified:
+            print(f"  → Já notificado — pulando.")
             continue
 
         if all_fields_filled(card):
-            print(f"  Campos OK, enviando Slack: {card['title']}")
+            print(f"  → Todos os campos preenchidos, enviando para o Slack...")
             send_slack(card)
-            new_notified.append(card["id"])
+            new_notified.add(card_id)  # adiciona ao set apenas após envio confirmado
         else:
-            print(f"  Campos incompletos: {card['title']}")
+            print(f"  → Campos incompletos — aguardando próxima execução.")
 
-    save_notified(new_notified)
-    print("Concluido.")
+    # Só salva se houve mudança
+    if new_notified != notified:
+        save_notified(new_notified)
+        print(f"\n  {len(new_notified) - len(notified)} novo(s) card(s) adicionado(s) ao controle.")
+    else:
+        print("\n  Nenhuma alteração no controle de notificados.")
+
+    print("\nConcluído.")
 
 
 if __name__ == "__main__":
